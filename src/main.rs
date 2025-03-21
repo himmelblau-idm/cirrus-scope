@@ -19,10 +19,11 @@ use himmelblau::error::MsalError;
 use himmelblau::graph::Graph;
 use himmelblau::{AuthOption, BrokerClientApplication, EnrollAttrs, MFAAuthContinue};
 use kanidm_hsm_crypto::soft::SoftTpm;
-use kanidm_hsm_crypto::{AuthValue, BoxedDynTpm, Tpm};
+use kanidm_hsm_crypto::{AuthValue, BoxedDynTpm, LoadableIdentityKey, LoadableMsOapxbcRsaKey, Tpm};
 use rpassword::read_password;
 use std::io;
 use std::io::Write;
+use std::process::ExitCode;
 use std::str::FromStr;
 use std::thread::sleep;
 use std::time::Duration;
@@ -42,8 +43,21 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, to_string as json_to_string};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, RecvError};
 use std::thread;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
+use tracing::{debug, info};
+
+mod db;
+use crate::db::Db;
+
+use clap::Parser;
+include!("./opt/tool.rs");
+
+const DEFAULT_DB_PATH: &str = "/var/cache/himmelblaud/himmelblau.cache.db";
+const DEFAULT_HSM_PIN_PATH: &str = "/var/lib/himmelblaud/hsm-pin";
 
 fn split_username(username: &str) -> Option<(&str, &str)> {
     let tup: Vec<&str> = username.split('@').collect();
@@ -204,252 +218,538 @@ async fn fido_auth(flow: &MFAAuthContinue) -> Result<String, Box<dyn std::error:
     Ok(json_to_string(&json_response).unwrap())
 }
 
-#[tokio::main]
-async fn main() {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::TRACE)
-        .finish();
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    let opt = CirrusScopeParser::parse();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed setting up default tracing subscriber.");
-
-    let mut username = String::new();
-    print!("Please enter your EntraID username: ");
-    io::stdout().flush().unwrap();
-    io::stdin()
-        .read_line(&mut username)
-        .expect("Failed to read username");
-    username = username.trim().to_string();
-
-    let (_, domain) = split_username(&username).expect("Failed splitting username");
-
-    let graph = Graph::new("odc.officeapps.live.com", &domain, None, None, None)
-        .await
-        .expect("Failed discovering tenant");
-    let authority_host = graph
-        .authority_host()
-        .await
-        .expect("Failed discovering tenant");
-    let tenant_id = graph.tenant_id().await.expect("Failed discovering tenant");
-
-    let authority = format!("https://{}/{}", authority_host, tenant_id);
-    println!("Creating the broker app");
-    let mut app =
-        BrokerClientApplication::new(Some(&authority), None, None, None).expect("Failed creating app");
-
-    let auth_options = vec![AuthOption::Fido, AuthOption::Passwordless];
-    let auth_init = app
-        .check_user_exists(&username, &auth_options)
-        .await
-        .expect("Failed checking if user exists");
-    println!("User {} exists? {}", &username, auth_init.exists());
-
-    let scope = vec![];
-
-    let password = if !auth_init.passwordless() {
-        print!("{} password: ", &username);
-        io::stdout().flush().unwrap();
-        match read_password() {
-            Ok(password) => Some(password),
-            Err(e) => {
-                println!("{:?}", e);
-                return ();
-            }
-        }
-    } else {
-        None
+    let debug = match opt.commands {
+        CirrusScopeOpt::AuthTest {
+            debug,
+            account_id: _,
+        } => debug,
+        CirrusScopeOpt::EnrollmentTest {
+            debug,
+            account_id: _,
+        } => debug,
+        CirrusScopeOpt::RefreshTokenAcquire {
+            debug,
+            account_id: _,
+        } => debug,
+        CirrusScopeOpt::ProvisionHelloKeyTest {
+            debug,
+            account_id: _,
+        } => debug,
+        CirrusScopeOpt::Version { debug } => debug,
     };
 
-    println!("Attempting device enrollment");
-    let mut tpm = BoxedDynTpm::new(SoftTpm::new());
-    let auth_str = AuthValue::generate().expect("Failed to create hex pin");
-    let auth_value = AuthValue::from_str(&auth_str).expect("Unable to create auth value");
-    // Request a new machine-key-context. This key "owns" anything
-    // created underneath it.
-    let loadable_machine_key = tpm
-        .machine_key_create(&auth_value)
-        .expect("Unable to create new machine key");
-    let machine_key = tpm
-        .machine_key_load(&auth_value, &loadable_machine_key)
-        .expect("Unable to load machine key");
-    let attrs = match EnrollAttrs::new(
-        domain.to_string(),
-        Some("test_machine".to_string()),
-        None,
-        Some(8),
-        None,
-    ) {
-        Ok(attrs) => attrs,
-        Err(e) => {
-            println!("{:?}", e);
-            return ();
-        }
-    };
-    let mut mfa_req = match app
-        .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
-            &username,
-            password.as_deref(),
-            &auth_options,
-            Some(auth_init),
-        )
-        .await
-    {
-        Ok(mfa) => mfa,
-        Err(e) => {
-            println!("{:?}", e);
-            return ();
-        }
-    };
-    print!("{}", mfa_req.msg);
+    let mut subscriber_builder = FmtSubscriber::builder();
+    if debug {
+        std::env::set_var("RUST_LOG", "debug");
+        subscriber_builder = subscriber_builder.with_max_level(Level::TRACE);
+    }
+    let subscriber = subscriber_builder.finish();
 
-    let token1 = match mfa_req.mfa_method.as_str() {
-        "FidoKey" => {
-            // Create the assertion
-            let assertion = match fido_auth(&mfa_req).await {
-                Ok(assertion) => assertion,
-                Err(e) => {
-                    println!("FIDO ASSERTION FAIL: {:?}", e);
-                    return ();
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        error!(?e, "Failed setting up default tracing subscriber.");
+        return ExitCode::FAILURE;
+    }
+
+    macro_rules! init {
+        ($account_id:expr) => {{
+            let (_, domain) = match split_username(&$account_id) {
+                Some(out) => out,
+                None => {
+                    error!("Could not split domain from input username");
+                    return ExitCode::FAILURE;
                 }
             };
-            match app
-                .acquire_token_by_mfa_flow(&username, Some(&assertion), None, &mut mfa_req)
-                .await
+
+            let graph = match Graph::new("odc.officeapps.live.com", &domain, None, None, None).await
             {
-                Ok(token) => token,
+                Ok(graph) => graph,
                 Err(e) => {
-                    println!("MFA FAIL: {:?}", e);
-                    return ();
+                    error!("Failed discovering tenant: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let authority_host = match graph.authority_host().await {
+                Ok(authority_host) => authority_host,
+                Err(e) => {
+                    error!("Failed discovering authority_host: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let tenant_id = match graph.tenant_id().await {
+                Ok(tenant_id) => tenant_id,
+                Err(e) => {
+                    error!("Failed discovering tenant_id: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let authority = format!("https://{}/{}", authority_host, tenant_id);
+
+            (domain, authority)
+        }};
+    }
+
+    macro_rules! client {
+        ($authority:expr, $transport_key:expr, $cert_key:expr) => {{
+            match BrokerClientApplication::new(Some(&$authority), None, $transport_key, $cert_key) {
+                Ok(app) => app,
+                Err(e) => {
+                    error!("Failed creating app: {:?}", e);
+                    return ExitCode::FAILURE;
                 }
             }
-        }
-        "PhoneAppOTP" | "OneWaySMS" | "ConsolidatedTelephony" => {
+        }};
+    }
+
+    macro_rules! auth {
+        ($app:expr, $account_id:expr) => {{
+            let auth_options = vec![AuthOption::Fido, AuthOption::Passwordless];
+            let auth_init = match $app.check_user_exists(&$account_id, &auth_options).await {
+                Ok(auth_init) => auth_init,
+                Err(e) => {
+                    error!("Failed checking if user exists: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            debug!("User {} exists? {}", &$account_id, auth_init.exists());
+
+            let password = if !auth_init.passwordless() {
+                print!("{} password: ", &$account_id);
+                io::stdout().flush().unwrap();
+                match read_password() {
+                    Ok(password) => Some(password),
+                    Err(e) => {
+                        error!("{:?}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut mfa_req = match $app
+                .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
+                    &$account_id,
+                    password.as_deref(),
+                    &auth_options,
+                    Some(auth_init),
+                )
+                .await
+            {
+                Ok(mfa) => mfa,
+                Err(e) => match e {
+                    MsalError::PasswordRequired => {
+                        print!("{} password: ", &$account_id);
+                        io::stdout().flush().unwrap();
+                        let password = match read_password() {
+                            Ok(password) => Some(password),
+                            Err(e) => {
+                                error!("{:?}", e);
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let auth_init = match $app.check_user_exists(&$account_id, &auth_options).await {
+                            Ok(auth_init) => auth_init,
+                            Err(e) => {
+                                error!("Failed checking if user exists: {:?}", e);
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        match $app
+                            .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
+                                &$account_id,
+                                password.as_deref(),
+                                &auth_options,
+                                Some(auth_init),
+                            )
+                            .await
+                        {
+                            Ok(mfa) => mfa,
+                            Err(e) => {
+                                error!("{:?}", e);
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                    _ => {
+                        error!("{:?}", e);
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            print!("{}", mfa_req.msg);
             io::stdout().flush().unwrap();
-            let input = match read_password() {
-                Ok(password) => password,
-                Err(e) => {
-                    println!("{:?} ", e);
-                    return ();
+
+            match mfa_req.mfa_method.as_str() {
+                "FidoKey" => {
+                    // Create the assertion
+                    let assertion = match fido_auth(&mfa_req).await {
+                        Ok(assertion) => assertion,
+                        Err(e) => {
+                            error!("FIDO ASSERTION FAIL: {:?}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    match $app
+                        .acquire_token_by_mfa_flow(
+                            &$account_id,
+                            Some(&assertion),
+                            None,
+                            &mut mfa_req,
+                        )
+                        .await
+                    {
+                        Ok(token) => token,
+                        Err(e) => {
+                            error!("MFA FAIL: {:?}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 }
-            };
-            match app
-                .acquire_token_by_mfa_flow(&username, Some(&input), None, &mut mfa_req)
+                "PhoneAppOTP" | "OneWaySMS" | "ConsolidatedTelephony" => {
+                    //io::stdout().flush().unwrap();
+                    let input = match read_password() {
+                        Ok(password) => password,
+                        Err(e) => {
+                            error!("{:?} ", e);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    match $app
+                        .acquire_token_by_mfa_flow(&$account_id, Some(&input), None, &mut mfa_req)
+                        .await
+                    {
+                        Ok(token) => token,
+                        Err(e) => {
+                            error!("MFA FAIL: {:?}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                _ => {
+                    let mut poll_attempt = 1;
+                    let polling_interval = mfa_req.polling_interval.unwrap_or(5000);
+                    loop {
+                        match $app
+                            .acquire_token_by_mfa_flow(
+                                &$account_id,
+                                None,
+                                Some(poll_attempt),
+                                &mut mfa_req,
+                            )
+                            .await
+                        {
+                            Ok(token) => break token,
+                            Err(e) => match e {
+                                MsalError::MFAPollContinue => {
+                                    poll_attempt += 1;
+                                    sleep(Duration::from_millis(polling_interval.into()));
+                                    continue;
+                                }
+                                e => {
+                                    error!("MFA FAIL: {:?}", e);
+                                    return ExitCode::FAILURE;
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }};
+    }
+
+    macro_rules! obtain_prt {
+        ($app:expr, $token:expr, $tpm:expr, $machine_key:expr, $scope:expr, $resource:expr) => {{
+            match $app
+                .acquire_token_by_refresh_token(
+                    &$token.refresh_token,
+                    $scope,
+                    $resource,
+                    &mut $tpm,
+                    &$machine_key,
+                )
                 .await
             {
                 Ok(token) => token,
                 Err(e) => {
-                    println!("MFA FAIL: {:?}", e);
-                    return ();
+                    error!("{:?}", e);
+                    return ExitCode::FAILURE;
                 }
             }
-        }
-        _ => {
-            let mut poll_attempt = 1;
-            let polling_interval = mfa_req.polling_interval.unwrap_or(5000);
-            loop {
-                match app
-                    .acquire_token_by_mfa_flow(&username, None, Some(poll_attempt), &mut mfa_req)
-                    .await
-                {
-                    Ok(token) => break token,
-                    Err(e) => match e {
-                        MsalError::MFAPollContinue => {
-                            poll_attempt += 1;
-                            sleep(Duration::from_millis(polling_interval.into()));
-                            continue;
-                        }
-                        e => {
-                            println!("MFA FAIL: {:?}", e);
-                            return ();
-                        }
-                    },
+        }};
+    }
+
+    macro_rules! obtain_host_data {
+        ($domain:expr) => {{
+            // Make sure the command is running as root
+            if unsafe { libc::geteuid() } != 0 {
+                error!("This command must be run as root.");
+                return ExitCode::FAILURE;
+            }
+
+            // Fetch the auth_value from Himmelblau
+            let path_buf = match PathBuf::from_str(DEFAULT_HSM_PIN_PATH) {
+                Ok(path_buf) => path_buf,
+                Err(e) => {
+                    error!(?e, "Failed to construct pathbuf for hsm pin path");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if !path_buf.exists() {
+                error!("HSM PIN file '{}' not found", DEFAULT_HSM_PIN_PATH);
+                return ExitCode::FAILURE;
+            }
+            let mut file = match File::open(DEFAULT_HSM_PIN_PATH).await {
+                Ok(file) => file,
+                Err(e) => {
+                    error!("Failed reading the HSM PIN: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut hsm_pin = vec![];
+            match file.read_to_end(&mut hsm_pin).await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Failed reading the HSM PIN: {:?}", e);
+                    return ExitCode::FAILURE;
                 }
             }
-        }
-    };
+            let auth_value = match AuthValue::try_from(hsm_pin.as_slice()) {
+                Ok(av) => av,
+                Err(e) => {
+                    error!("invalid hsm pin: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
 
-    let (_transport_key, _cert_key, device_id) = match app
-        .enroll_device(&token1.refresh_token, attrs, &mut tpm, &machine_key)
-        .await
-    {
-        Ok((transport_key, cert_key, device_id)) => (transport_key, cert_key, device_id),
-        Err(e) => {
-            println!("{:?}", e);
-            return ();
-        }
-    };
-    println!("Enrolled with device id: {}", device_id);
+            let mut db = match Db::new(DEFAULT_DB_PATH) {
+                Ok(db) => db,
+                Err(e) => {
+                    error!("Failed loading Himmelblau cache: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
 
-    println!("Obtain PRT from enrollment refresh token");
-    let token = match app
-        .acquire_token_by_refresh_token(
-            &token1.refresh_token,
-            scope.clone(),
-            None,
-            &mut tpm,
-            &machine_key,
-        )
-        .await
-    {
-        Ok(token) => token,
-        Err(e) => {
-            println!("{:?}", e);
-            return ();
-        }
-    };
-    println!(
-        "access_token: {}, spn: {}, uuid: {:?}, mfa?: {:?}",
-        token.access_token.clone().unwrap(),
-        token.spn().unwrap(),
-        token.uuid().unwrap(),
-        token.amr_mfa().unwrap()
-    );
+            let mut tpm = BoxedDynTpm::new(SoftTpm::new());
 
-    println!("Provision hello key");
-    let win_hello_key = match app
-        .provision_hello_for_business_key(&token1, &mut tpm, &machine_key, "123456")
-        .await
-    {
-        Ok(win_hello_key) => win_hello_key,
-        Err(e) => {
-            println!("{:?}", e);
-            return ();
-        }
-    };
-    println!("{:?}", win_hello_key);
+            // Fetch the machine key
+            let loadable_machine_key = match db.get_hsm_machine_key() {
+                Ok(Some(lmk)) => lmk,
+                Err(e) => {
+                    error!("Unable to access hsm loadable machine key: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+                _ => {
+                    error!("Unable to access hsm loadable machine key.");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let machine_key = match tpm.machine_key_load(&auth_value, &loadable_machine_key) {
+                Ok(mk) => mk,
+                Err(e) => {
+                    error!("Unable to load machine root key: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
 
-    println!("Acquire token via hello key");
-    let token4 = match app
-        .acquire_token_by_hello_for_business_key(
-            &username,
-            &win_hello_key,
-            vec![],
-            None,
-            &mut tpm,
-            &machine_key,
-            "123456",
-        )
-        .await
-    {
-        Ok(token) => token,
-        Err(e) => {
-            println!("{:?}", e);
-            return ();
-        }
-    };
-    println!(
-        "access_token: {}, spn: {}, uuid: {:?}, mfa?: {:?}",
-        token4.access_token.clone().unwrap(),
-        token4.spn().unwrap(),
-        token4.uuid().unwrap(),
-        token4.amr_mfa().unwrap()
-    );
+            // Fetch the transport key
+            let tranport_key_tag = format!("{}/transport", $domain);
+            let loadable_transport_key: LoadableMsOapxbcRsaKey =
+                match db.get_tagged_hsm_key(&tranport_key_tag) {
+                    Ok(Some(ltk)) => ltk,
+                    Err(e) => {
+                        error!("Unable to access hsm loadable transport key: {:?}", e);
+                        return ExitCode::FAILURE;
+                    }
+                    _ => {
+                        error!("Unable to access hsm loadable transport key.");
+                        return ExitCode::FAILURE;
+                    }
+                };
 
-    let _prt = match &token4.prt {
-        Some(prt) => prt.clone(),
-        None => {
-            println!("Failed to find PRT in Hello token!");
-            return ();
+            // Fetch the certificate key
+            let cert_key_tag = format!("{}/certificate", $domain);
+            let loadable_cert_key: LoadableIdentityKey = match db.get_tagged_hsm_key(&cert_key_tag)
+            {
+                Ok(Some(ltk)) => ltk,
+                Err(e) => {
+                    error!("Unable to access hsm certificate key: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+                _ => {
+                    error!("Unable to access hsm certificate key.");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            (tpm, loadable_transport_key, loadable_cert_key, machine_key)
+        }};
+    }
+
+    match opt.commands {
+        CirrusScopeOpt::AuthTest {
+            debug: _,
+            account_id,
+        } => {
+            let (_domain, authority) = init!(account_id);
+            let app = client!(authority, None, None);
+            let token = auth!(app, account_id);
+            println!(
+                "access_token: {}, spn: {}, uuid: {:?}, mfa?: {:?}",
+                token.access_token.clone().unwrap(),
+                token.spn().unwrap(),
+                token.uuid().unwrap(),
+                token.amr_mfa().unwrap()
+            );
+            ExitCode::SUCCESS
         }
-    };
+        CirrusScopeOpt::EnrollmentTest {
+            debug: _,
+            account_id,
+        } => {
+            let (domain, authority) = init!(account_id);
+            let mut app = client!(authority, None, None);
+            let token = auth!(app, account_id);
+
+            // Danger zone! This command leaves artifacts in the Entra Id directory
+            info!("Attempting device enrollment");
+            let mut tpm = BoxedDynTpm::new(SoftTpm::new());
+            let auth_str = AuthValue::generate().expect("Failed to create hex pin");
+            let auth_value = AuthValue::from_str(&auth_str).expect("Unable to create auth value");
+            // Request a new machine-key-context. This key "owns" anything
+            // created underneath it.
+            let loadable_machine_key = tpm
+                .machine_key_create(&auth_value)
+                .expect("Unable to create new machine key");
+            let machine_key = tpm
+                .machine_key_load(&auth_value, &loadable_machine_key)
+                .expect("Unable to load machine key");
+            let attrs = match EnrollAttrs::new(
+                domain.to_string(),
+                Some("cirrus-scope-test-machine".to_string()),
+                None,
+                None,
+                None,
+            ) {
+                Ok(attrs) => attrs,
+                Err(e) => {
+                    error!("{:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let (_transport_key, _cert_key, device_id) = match app
+                .enroll_device(&token.refresh_token, attrs, &mut tpm, &machine_key)
+                .await
+            {
+                Ok((transport_key, cert_key, device_id)) => (transport_key, cert_key, device_id),
+                Err(e) => {
+                    error!("{:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            println!("Enrolled with device id: {}", device_id);
+            ExitCode::SUCCESS
+        }
+        CirrusScopeOpt::RefreshTokenAcquire {
+            debug: _,
+            account_id,
+        } => {
+            let (domain, authority) = init!(account_id);
+            let (mut tpm, loadable_transport_key, loadable_cert_key, machine_key) =
+                obtain_host_data!(domain);
+            let app = client!(
+                authority,
+                Some(loadable_transport_key),
+                Some(loadable_cert_key)
+            );
+            let token = auth!(app, account_id);
+
+            info!("Obtain PRT from refresh token");
+            let token = obtain_prt!(app, token, tpm, machine_key, vec![], None);
+            println!(
+                "access_token: {}, spn: {}, uuid: {:?}, mfa?: {:?}",
+                token.access_token.clone().unwrap(),
+                token.spn().unwrap(),
+                token.uuid().unwrap(),
+                token.amr_mfa().unwrap()
+            );
+            ExitCode::SUCCESS
+        }
+        CirrusScopeOpt::ProvisionHelloKeyTest {
+            debug: _,
+            account_id,
+        } => {
+            let (domain, authority) = init!(account_id);
+            let (mut tpm, loadable_transport_key, loadable_cert_key, machine_key) =
+                obtain_host_data!(domain);
+            let app = client!(
+                authority,
+                Some(loadable_transport_key),
+                Some(loadable_cert_key)
+            );
+            let token = auth!(app, account_id);
+            let token2 = obtain_prt!(app, token, tpm, machine_key, vec![], None);
+
+            info!("Provision hello key");
+            let win_hello_key = match app
+                .provision_hello_for_business_key(
+                    &token2,
+                    &mut tpm,
+                    &machine_key,
+                    "123456",
+                )
+                .await
+            {
+                Ok(win_hello_key) => win_hello_key,
+                Err(e) => {
+                    error!("{:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            println!("{:?}", win_hello_key);
+
+            info!("Acquire token via hello key");
+            let token4 = match app
+                .acquire_token_by_hello_for_business_key(
+                    &account_id,
+                    &win_hello_key,
+                    vec![],
+                    None,
+                    &mut tpm,
+                    &machine_key,
+                    "123456",
+                )
+                .await
+            {
+                Ok(token) => token,
+                Err(e) => {
+                    error!("{:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            println!(
+                "access_token: {}, spn: {}, uuid: {:?}, mfa?: {:?}",
+                token4.access_token.clone().unwrap(),
+                token4.spn().unwrap(),
+                token4.uuid().unwrap(),
+                token4.amr_mfa().unwrap()
+            );
+
+            if token4.prt.is_none() {
+                error!("Failed to find PRT in Hello token!");
+            }
+            ExitCode::SUCCESS
+        }
+        CirrusScopeOpt::Version { debug: _ } => {
+            println!("cirrus-scope {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+    }
 }
