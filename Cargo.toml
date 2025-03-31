@@ -2,6 +2,13 @@
 name = "cirrus-scope"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+homepage = "https://himmelblau-idm.org/"
+repository = "https://github.com/himmelblau-idm/cirrus-scope"
+authors = [
+    "David Mulder <dmulder@suse.com>"
+]
+description = "Diagnostic utility for debugging Entra ID authentication issues via libhimmelblau"
 
 [dependencies]
 libhimmelblau = { version = "0.6.9", features = ["developer"] }
@@ -24,3 +31,20 @@ libc = "0.2.171"
 clap = { version = "4.5.32", features = ["derive"] }
 sketching = "1.5.0"
 rusqlite = "0.34.0"
+
+[package.metadata.deb]
+name = "cirrus-scope"
+maintainer = "David Mulder <dmulder@himmelblau-idm.org>"
+depends = ["$auto"]
+assets = [
+  ["target/release/cirrus-scope", "usr/bin/", "755"],
+  ["man/man1/cirrus-scope.1", "usr/share/man/man1/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "cirrus-scope"
+maintainer = "David Mulder <dmulder@himmelblau-idm.org>"
+assets = [
+  { source = "target/release/cirrus-scope", dest = "/usr/bin/", mode = "755" },
+  { source = "man/man1/cirrus-scope.1", dest = "/usr/share/man/man1/", mode = "644" },
+]

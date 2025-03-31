@@ -1,0 +1,147 @@
+.TH CIRRUS-SCOPE "1" "March 2025" "cirrus-scope 0.1.0" "User Commands"
+.SH NAME
+cirrus-scope \- diagnostic utility for debugging Entra ID authentication issues via libhimmelblau
+.SH SYNOPSIS
+.B cirrus-scope
+\fI<COMMAND>\fR [OPTIONS]
+.SH DESCRIPTION
+cirrus-scope is a command-line utility designed to help Himmelblau users and developers diagnose and investigate authentication issues when using libhimmelblau integration with Azure Entra ID.
+
+It provides targeted test commands to simulate login, device enrollment, token refresh, and Hello for Business key provisioning. This tool collects debug output and enables packet capture through optional proxy configuration, making it easier to share failure context with Himmelblau maintainers.
+
+Authentication input (such as usernames and passwords) is provided interactively at the terminal.
+
+.SS Commands:
+.TP
+.B auth-test
+Test authentication of a user using MFA
+.TP
+.B enrollment-test
+Test device enrollment
+.TP
+.B refresh-token-acquire
+Acquire a new access token using a refresh token
+.TP
+.B provision-hello-key-test
+Test provisioning of a Hello for Business key
+.TP
+.B version
+Show the version of this tool
+.TP
+.B help
+Print the command help message or the help of the given subcommand(s)
+
+.SH AUTH-TEST SUBCOMMAND
+
+Test authentication of a user using MFA.
+
+This command initiates an MFA flow (using FIDO, PhoneAppOTP, etc.) to validate user authentication. It simulates the process of signing in and logs detailed debug information if enabled. The provided \fBaccount_id\fR specifies which user account to test.
+
+.SH OPTIONS
+.HP
+\fB\-d\fR, \fB\-\-debug\fR
+Enable verbose debug output
+.HP
+\fB\-D\fR, \fB\-\-name\fR <ACCOUNT_ID>
+Specify the user account to authenticate
+.HP
+\fB\-h\fR, \fB\-\-help\fR
+Print help for this subcommand
+
+.SH ENROLLMENT-TEST SUBCOMMAND
+
+Test device enrollment.
+
+WARNING: This enrollment leaves artifacts in Entra ID and does not actually enroll the host! Proceed only if you are capable of removing the `cirrus-scope-test-machine` object from your directory.
+
+This command simulates device enrollment by generating a SoftHSM-based machine key, performing the MFA enrollment flow, and sending the registration payload. It is intended for debug and analysis only.
+
+.SH OPTIONS
+.HP
+\fB\-d\fR, \fB\-\-debug\fR
+Enable verbose debug output
+.HP
+\fB\-D\fR, \fB\-\-name\fR <ACCOUNT_ID>
+Specify the user account to associate with device enrollment
+.HP
+\fB\-h\fR, \fB\-\-help\fR
+Print help for this subcommand
+
+.SH REFRESH-TOKEN-ACQUIRE SUBCOMMAND
+
+Acquire a new access token using a refresh token.
+
+This command validates the token refresh flow by authenticating a user, then using the obtained refresh token to acquire a new access token.
+
+.SH OPTIONS
+.HP
+\fB\-d\fR, \fB\-\-debug\fR
+Enable verbose debug output
+.HP
+\fB\-D\fR, \fB\-\-name\fR <ACCOUNT_ID>
+Specify the user account for which to perform the token refresh
+.HP
+\fB\-h\fR, \fB\-\-help\fR
+Print help for this subcommand
+
+.SH PROVISION-HELLO-KEY-TEST SUBCOMMAND
+
+Test provisioning of a Hello for Business key.
+
+WARNING: This test leaves key artifacts attached to the user account in Entra ID. It does not store a usable Hello key on the local device and is intended only for investigation.
+
+This command initiates Hello key creation, sends the key to Entra ID, and validates the provisioning process by attempting to acquire an access token via PRT.
+
+.SH OPTIONS
+.HP
+\fB\-d\fR, \fB\-\-debug\fR
+Enable verbose debug output
+.HP
+\fB\-D\fR, \fB\-\-name\fR <ACCOUNT_ID>
+Specify the user account to test Hello key provisioning
+.HP
+\fB\-h\fR, \fB\-\-help\fR
+Print help for this subcommand
+
+.SH VERSION SUBCOMMAND
+
+Display the current version of cirrus-scope.
+
+.SH OPTIONS
+.HP
+\fB\-d\fR, \fB\-\-debug\fR
+Enable verbose debug output
+.HP
+\fB\-h\fR, \fB\-\-help\fR
+Print help for this subcommand
+
+.SH GLOBAL OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print general help or help for a specific subcommand
+
+.SH ENVIRONMENT
+cirrus-scope supports the following environment variables to aid in packet capture and traffic analysis:
+
+.TP
+.B HTTPS_PROXY
+Route all outbound HTTPS traffic through the specified proxy server.
+.TP
+.B ALL_PROXY
+Alternative way to specify the proxy for all traffic.
+
+Use with tools like \fBmitmproxy\fR to capture traffic and help Himmelblau developers identify protocol or connectivity issues.
+
+.SH EXAMPLES
+.TP
+\fBcirrus-scope auth-test --name test_user@example.com\fR
+Run an interactive MFA login test.
+.TP
+\fBHTTPS_PROXY=http://localhost:8080 cirrus-scope enrollment-test --name test_user@example.com\fR
+Send enrollment traffic through mitmproxy listening on port 8080.
+
+.SH AUTHOR
+David Mulder <dmulder@himmelblau-idm.org>
+
+.SH COPYRIGHT
+Copyright 2025 David Mulder. Licensed under the GPLv3 license.
