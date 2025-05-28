@@ -412,7 +412,7 @@ async fn main() -> ExitCode {
                         }
                     }
                 }
-                "PhoneAppOTP" | "OneWaySMS" | "ConsolidatedTelephony" => {
+                "AccessPass" | "PhoneAppOTP" | "OneWaySMS" | "ConsolidatedTelephony" => {
                     //io::stdout().flush().unwrap();
                     let input = match read_password() {
                         Ok(password) => password,
