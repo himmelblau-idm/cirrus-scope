@@ -20,6 +20,7 @@ use himmelblau::graph::Graph;
 use himmelblau::{AuthOption, BrokerClientApplication, EnrollAttrs, MFAAuthContinue};
 use kanidm_hsm_crypto::soft::SoftTpm;
 use kanidm_hsm_crypto::{AuthValue, BoxedDynTpm, LoadableIdentityKey, LoadableMsOapxbcRsaKey, Tpm};
+use regex::Regex;
 use rpassword::read_password;
 use std::io;
 use std::io::Write;
@@ -39,9 +40,9 @@ use authenticator::{
     statecallback::StateCallback,
     Pin, StatusPinUv, StatusUpdate,
 };
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
-use serde_json::{json, to_string as json_to_string};
+use serde_json::{json, to_string as json_to_string, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, RecvError};
@@ -218,6 +219,226 @@ async fn fido_auth(flow: &MFAAuthContinue) -> Result<String, Box<dyn std::error:
     Ok(json_to_string(&json_response).unwrap())
 }
 
+fn is_valid_base64url(s: &str) -> bool {
+    URL_SAFE_NO_PAD.decode(s).is_ok_and(|v| v.len() >= 10)
+}
+
+fn obfuscate_jwt_and_jwe(input: &str) -> String {
+    let jwt_re = Regex::new(r"([A-Za-z0-9\-_]+)\.([A-Za-z0-9\-_]+)\.([A-Za-z0-9\-_]*)").unwrap();
+    let jwe_re = Regex::new(r"([A-Za-z0-9\-_]+)\.([A-Za-z0-9\-_]+)\.([A-Za-z0-9\-_]+)\.([A-Za-z0-9\-_]+)\.([A-Za-z0-9\-_]+)").unwrap();
+
+    let mut result = jwe_re
+        .replace_all(input, |caps: &regex::Captures| {
+            if (1..=5).all(|i| is_valid_base64url(&caps[i])) {
+                "*".repeat(caps[0].len())
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned();
+
+    result = jwt_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let h = &caps[1];
+            let p = &caps[2];
+            if is_valid_base64url(h) && is_valid_base64url(p) {
+                debug!("MATCHED: {}", caps[0].to_string());
+                "*".repeat(caps[0].len())
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned();
+
+    result
+}
+
+fn obfuscate_refresh_tokens(input: &str) -> String {
+    let re = Regex::new(r"\d\.[A-Za-z0-9\-_]+(?:\.[A-Za-z0-9\-_]+)+").unwrap();
+
+    re.replace_all(input, |caps: &regex::Captures| {
+        let token = &caps[0];
+        let parts: Vec<&str> = token.split('.').collect();
+
+        let mut valid_parts = 0;
+        for part in &parts[1..] {
+            // skip version digit
+            if is_valid_base64url(part) {
+                valid_parts += 1;
+            }
+        }
+
+        if valid_parts >= 2 {
+            debug!("MATCHED: {}", token.to_string());
+            "*".repeat(token.len())
+        } else {
+            token.to_string()
+        }
+    })
+    .into_owned()
+}
+
+fn is_base64_json(s: &str) -> bool {
+    // Try base64url first
+    if let Ok(decoded) = URL_SAFE_NO_PAD.decode(s) {
+        if let Ok(decoded_str) = std::str::from_utf8(&decoded) {
+            return serde_json::from_str::<Value>(decoded_str).is_ok();
+        }
+    }
+    // Then try standard base64
+    if let Ok(decoded) = STANDARD_NO_PAD.decode(s) {
+        if let Ok(decoded_str) = std::str::from_utf8(&decoded) {
+            return serde_json::from_str::<Value>(decoded_str).is_ok();
+        }
+    }
+    false
+}
+
+fn obfuscate_base64_json_blobs(input: &str) -> String {
+    let re = Regex::new(r"[A-Za-z0-9\-_]{20,}").unwrap();
+
+    re.replace_all(input, |caps: &regex::Captures| {
+        let candidate = &caps[0];
+        if is_base64_json(candidate) {
+            debug!("MATCHED: {}", candidate.to_string());
+            "*".repeat(candidate.len())
+        } else {
+            candidate.to_string()
+        }
+    })
+    .into_owned()
+}
+
+fn decode_any_base64(candidate: &str) -> Option<Vec<u8>> {
+    STANDARD
+        .decode(candidate)
+        .or_else(|_| URL_SAFE.decode(candidate))
+        .or_else(|_| STANDARD_NO_PAD.decode(candidate))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(candidate))
+        .ok()
+}
+
+fn obfuscate_kerberos_tgts(input: &str) -> String {
+    let re = Regex::new(r"[A-Za-z0-9\+/=]{500,}").unwrap(); // include + / = explicitly
+
+    re.replace_all(input, |caps: &regex::Captures| {
+        let candidate = &caps[0];
+
+        if let Some(decoded) = decode_any_base64(candidate) {
+            if is_likely_kerberos_ticket(&decoded) {
+                debug!("MATCHED: {}", candidate.to_string());
+                return "*".repeat(candidate.len());
+            }
+        }
+
+        candidate.to_string()
+    })
+    .into_owned()
+}
+
+fn is_likely_kerberos_ticket(decoded: &[u8]) -> bool {
+    // DER typically starts with SEQUENCE (0x30) or application-specific tag (0x6B)
+    matches!(decoded.first(), Some(0x30) | Some(0x6B))
+}
+
+fn extract_tenant_guid(input: &str) -> Option<String> {
+    let re = Regex::new(r#""tenantId"\s*:\s*"([0-9a-fA-F\-]{36})""#).unwrap();
+    re.captures(input).map(|caps| caps[1].to_string())
+}
+
+fn obfuscate_tenant_id(input: &str) -> String {
+    if let Some(tenant_guid) = extract_tenant_guid(input) {
+        debug!("MATCHED: {}", tenant_guid.to_string());
+        input.replace(&tenant_guid, "00000000-0000-0000-0000-000000000000")
+    } else {
+        input.to_string()
+    }
+}
+
+fn obfuscate_flow_tokens(input: &str) -> String {
+    let re = Regex::new(r"[A-Za-z0-9\-_]{100,}").unwrap();
+
+    re.replace_all(input, |caps: &regex::Captures| {
+        let candidate = &caps[0];
+
+        if let Ok(decoded) = URL_SAFE_NO_PAD.decode(candidate) {
+            if decoded.len() >= 30 && is_likely_flow_token(&decoded) {
+                debug!("MATCHED: {}", candidate.to_string());
+                return "*".repeat(candidate.len());
+            }
+        }
+
+        candidate.to_string()
+    })
+    .into_owned()
+}
+
+fn is_likely_flow_token(decoded: &[u8]) -> bool {
+    decoded.starts_with(&[0x01, 0x00, 0x01])
+}
+
+fn is_likely_request_object(decoded: &[u8]) -> bool {
+    decoded.starts_with(&[0xAD, 0x04])
+}
+
+fn obfuscate_request_objects(input: &str) -> String {
+    let re = Regex::new(r"rQ[A-Za-z0-9\-_]{50,}").unwrap();
+
+    re.replace_all(input, |caps: &regex::Captures| {
+        let candidate = &caps[0];
+        if let Ok(decoded) = URL_SAFE_NO_PAD.decode(candidate) {
+            if decoded.len() >= 30 && is_likely_request_object(&decoded) {
+                debug!("MATCHED: {}", candidate.to_string());
+                return "*".repeat(candidate.len());
+            }
+        }
+        candidate.to_string()
+    })
+    .into_owned()
+}
+
+fn extract_domain(input: &str) -> Option<String> {
+    let re = Regex::new(r"domain=([a-zA-Z0-9\.-]+)").unwrap();
+    re.captures(input).map(|caps| caps[1].to_string())
+}
+
+fn obfuscate_domain(input: &str) -> String {
+    if let Some(domain) = extract_domain(input) {
+        debug!("MATCHED: {}", domain);
+        let replacement = "*".repeat(domain.len());
+        input.replace(&domain, &replacement)
+    } else {
+        input.to_string()
+    }
+}
+
+fn obfuscate_custom_strings(input: &str, custom_strings: &[&str]) -> String {
+    let mut output = input.to_string();
+    for &secret in custom_strings {
+        if !secret.is_empty() {
+            let replacement = "*".repeat(secret.len());
+            debug!("MATCHED: {}", secret);
+            output = output.replace(secret, &replacement);
+        }
+    }
+    output
+}
+
+fn obfuscate_text(input: &str, custom_strings: &[&str]) -> String {
+    let mut result = input.to_string();
+    result = obfuscate_custom_strings(&result, custom_strings);
+    result = obfuscate_tenant_id(&result);
+    result = obfuscate_domain(&result);
+    result = obfuscate_jwt_and_jwe(&result);
+    result = obfuscate_refresh_tokens(&result);
+    result = obfuscate_base64_json_blobs(&result);
+    result = obfuscate_kerberos_tgts(&result);
+    result = obfuscate_flow_tokens(&result);
+    result = obfuscate_request_objects(&result);
+
+    result
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let opt = CirrusScopeParser::parse();
@@ -230,6 +451,12 @@ async fn main() -> ExitCode {
         CirrusScopeOpt::EnrollmentTest {
             debug,
             account_id: _,
+        } => debug,
+        CirrusScopeOpt::Obfuscate {
+            debug,
+            custom: _,
+            input: _,
+            output: _,
         } => debug,
         CirrusScopeOpt::RefreshTokenAcquire {
             debug,
@@ -354,13 +581,14 @@ async fn main() -> ExitCode {
                                 return ExitCode::FAILURE;
                             }
                         };
-                        let auth_init = match $app.check_user_exists(&$account_id, &auth_options).await {
-                            Ok(auth_init) => auth_init,
-                            Err(e) => {
-                                error!("Failed checking if user exists: {:?}", e);
-                                return ExitCode::FAILURE;
-                            }
-                        };
+                        let auth_init =
+                            match $app.check_user_exists(&$account_id, &auth_options).await {
+                                Ok(auth_init) => auth_init,
+                                Err(e) => {
+                                    error!("Failed checking if user exists: {:?}", e);
+                                    return ExitCode::FAILURE;
+                                }
+                            };
                         match $app
                             .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
                                 &$account_id,
@@ -657,6 +885,31 @@ async fn main() -> ExitCode {
             println!("Enrolled with device id: {}", device_id);
             ExitCode::SUCCESS
         }
+        CirrusScopeOpt::Obfuscate {
+            debug: _,
+            custom,
+            input,
+            output,
+        } => {
+            let content = match std::fs::read_to_string(input) {
+                Ok(content) => content,
+                Err(e) => {
+                    error!("Failed to read input file: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let custom_refs: Vec<&str> = custom.iter().map(|s| s.as_str()).collect();
+            let obfuscated = obfuscate_text(&content, &custom_refs);
+            match std::fs::write(output, obfuscated) {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Failed to write output file: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            ExitCode::SUCCESS
+        }
         CirrusScopeOpt::RefreshTokenAcquire {
             debug: _,
             account_id,
@@ -699,12 +952,7 @@ async fn main() -> ExitCode {
 
             info!("Provision hello key");
             let win_hello_key = match app
-                .provision_hello_for_business_key(
-                    &token2,
-                    &mut tpm,
-                    &machine_key,
-                    "123456",
-                )
+                .provision_hello_for_business_key(&token2, &mut tpm, &machine_key, "123456")
                 .await
             {
                 Ok(win_hello_key) => win_hello_key,

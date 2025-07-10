@@ -57,4 +57,4 @@ WORKDIR /cirrus-scope
 RUN cargo install cargo-deb
 
 # Build the project and create the .deb package
-CMD cargo clean && cargo deb --deb-revision=ubuntu22.04
+CMD cargo deb --deb-revision=ubuntu22.04

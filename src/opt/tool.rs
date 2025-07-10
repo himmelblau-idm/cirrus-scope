@@ -46,6 +46,39 @@ pub enum CirrusScopeOpt {
         #[clap(short = 'D', long = "name")]
         account_id: String,
     },
+    /// Obfuscate sensitive data from a packet dump.
+    ///
+    /// This command reads a mitmproxy dump file or other captured network traffic,
+    /// then systematically obfuscates sensitive data to protect privacy and security.
+    /// It detects and replaces known token types such as JWTs, Kerberos TGTs, flow tokens,
+    /// device enrollment request blobs, and your Entra ID tenant ID. Exact-length replacements ensure
+    /// the resulting dump remains structurally valid for tools like mitmproxy.
+    ///
+    /// Additionally, you may specify one or more `--custom` strings, each of which will be replaced
+    /// wherever found in the text with a sequence of asterisks of the same length.
+    ///
+    /// The obfuscated output is written to the specified file. Enable debug mode to print detailed
+    /// information about what patterns were matched and replaced.
+    ///
+    /// NOTE: While this tool makes every reasonable attempt to identify and obfuscate sensitive
+    /// data-such as JWTs, Kerberos tickets, flow tokens, request blobs, and your Entra ID
+    /// tenant ID-it remains your responsibility to ensure that no secrets remain in the processed
+    /// file. Passwords and other plaintext credentials are NOT automatically detected and must be
+    /// explicitly provided via the `--custom` option for obfuscation.
+    ///
+    /// NOTE: Do not manually edit the file to remove secrets. Manual modifications are very likely
+    /// to corrupt the structure of the dump, rendering it unreadable for debugging. Always use this
+    /// tool's obfuscation process to maintain structural integrity of the packet dump.
+    Obfuscate {
+        #[clap(short, long)]
+        debug: bool,
+        #[arg(long, value_name = "STRING", action = clap::ArgAction::Append)]
+        custom: Vec<String>,
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Acquire a new access token using a refresh token.
     ///
     /// This command tests the token refresh mechanism by acquiring a new access token through an enrollment

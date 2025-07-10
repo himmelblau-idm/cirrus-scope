@@ -52,4 +52,4 @@ WORKDIR /cirrus-scope
 RUN cargo install cargo-generate-rpm
 
 # Build the project and create the .deb package
-CMD cargo clean && cargo build --release && cargo generate-rpm
+CMD cargo build --release && cargo generate-rpm
