@@ -1,4 +1,4 @@
-use kanidm_hsm_crypto::LoadableMachineKey;
+use kanidm_hsm_crypto::structures::LoadableStorageKey;
 use rusqlite::{named_params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 
@@ -18,7 +18,7 @@ impl Db {
         Ok(Db { conn })
     }
 
-    pub fn get_hsm_machine_key(&mut self) -> Result<Option<LoadableMachineKey>, CacheError> {
+    pub fn get_hsm_machine_key(&mut self) -> Result<Option<LoadableStorageKey>, CacheError> {
         let mut stmt = self
             .conn
             .prepare("SELECT value FROM hsm_int_t WHERE key = 'mk'")

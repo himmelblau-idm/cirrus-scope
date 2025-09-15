@@ -11,12 +11,12 @@ authors = [
 description = "Diagnostic utility for debugging Entra ID authentication issues via libhimmelblau"
 
 [dependencies]
-libhimmelblau = { version = "0.6.20", features = ["developer"] }
+libhimmelblau = { version = "0.7.16", features = ["developer"] }
 tokio = { version = "1.35.1", features = ["full"] }
 openssl = "0.10.62"
 uuid = { version = "^1.4.1", features = [ "v4" ] }
 num-traits = "^0.2.17"
-kanidm-hsm-crypto = { version = "^0.2.0", features = ["msextensions"] }
+kanidm-hsm-crypto = { version = "^0.3.4" }
 rpassword = "7.3.1"
 anyhow = "1.0.83"
 reqwest = "0.12.4"

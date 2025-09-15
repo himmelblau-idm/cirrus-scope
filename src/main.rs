@@ -18,8 +18,9 @@
 use himmelblau::error::MsalError;
 use himmelblau::graph::Graph;
 use himmelblau::{AuthOption, BrokerClientApplication, EnrollAttrs, MFAAuthContinue};
-use kanidm_hsm_crypto::soft::SoftTpm;
-use kanidm_hsm_crypto::{AuthValue, BoxedDynTpm, LoadableIdentityKey, LoadableMsOapxbcRsaKey, Tpm};
+use kanidm_hsm_crypto::provider::{BoxedDynTpm, SoftTpm, Tpm};
+use kanidm_hsm_crypto::structures::{LoadableMsDeviceEnrolmentKey, LoadableRS256Key};
+use kanidm_hsm_crypto::AuthValue;
 use regex::Regex;
 use rpassword::read_password;
 use std::io;
@@ -778,7 +779,7 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let machine_key = match tpm.machine_key_load(&auth_value, &loadable_machine_key) {
+            let machine_key = match tpm.root_storage_key_load(&auth_value, &loadable_machine_key) {
                 Ok(mk) => mk,
                 Err(e) => {
                     error!("Unable to load machine root key: {:?}", e);
@@ -788,7 +789,7 @@ async fn main() -> ExitCode {
 
             // Fetch the transport key
             let tranport_key_tag = format!("{}/transport", $domain);
-            let loadable_transport_key: LoadableMsOapxbcRsaKey =
+            let loadable_transport_key: LoadableRS256Key =
                 match db.get_tagged_hsm_key(&tranport_key_tag) {
                     Ok(Some(ltk)) => ltk,
                     Err(e) => {
@@ -803,18 +804,18 @@ async fn main() -> ExitCode {
 
             // Fetch the certificate key
             let cert_key_tag = format!("{}/certificate", $domain);
-            let loadable_cert_key: LoadableIdentityKey = match db.get_tagged_hsm_key(&cert_key_tag)
-            {
-                Ok(Some(ltk)) => ltk,
-                Err(e) => {
-                    error!("Unable to access hsm certificate key: {:?}", e);
-                    return ExitCode::FAILURE;
-                }
-                _ => {
-                    error!("Unable to access hsm certificate key.");
-                    return ExitCode::FAILURE;
-                }
-            };
+            let loadable_cert_key: LoadableMsDeviceEnrolmentKey =
+                match db.get_tagged_hsm_key(&cert_key_tag) {
+                    Ok(Some(ltk)) => ltk,
+                    Err(e) => {
+                        error!("Unable to access hsm certificate key: {:?}", e);
+                        return ExitCode::FAILURE;
+                    }
+                    _ => {
+                        error!("Unable to access hsm certificate key.");
+                        return ExitCode::FAILURE;
+                    }
+                };
 
             (tpm, loadable_transport_key, loadable_cert_key, machine_key)
         }};
@@ -853,10 +854,10 @@ async fn main() -> ExitCode {
             // Request a new machine-key-context. This key "owns" anything
             // created underneath it.
             let loadable_machine_key = tpm
-                .machine_key_create(&auth_value)
+                .root_storage_key_create(&auth_value)
                 .expect("Unable to create new machine key");
             let machine_key = tpm
-                .machine_key_load(&auth_value, &loadable_machine_key)
+                .root_storage_key_load(&auth_value, &loadable_machine_key)
                 .expect("Unable to load machine key");
             let attrs = match EnrollAttrs::new(
                 domain.to_string(),
